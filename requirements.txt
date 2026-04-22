@@ -1,0 +1,5 @@
+# trend-scout runs on pure stdlib by default.
+# These deps unlock specific features:
+
+# Required for TikTok scraping (used by auto_research.py, telegram_research_bot.py)
+apify-client>=1.7.0

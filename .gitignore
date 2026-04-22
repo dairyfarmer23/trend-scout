@@ -1,0 +1,35 @@
+# Environment
+.env
+.env.local
+*.env
+!*.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Data generated at runtime
+knowledge_base/raw/
+knowledge_base/outputs/
+shared_memory.json
+manager_scripts.json
+chat_history.json
+feedback_local.json
+pending_links.json
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
