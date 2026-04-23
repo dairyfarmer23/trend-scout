@@ -2,4 +2,4 @@
 # These deps unlock specific features:
 
 # Required for TikTok scraping (used by auto_research.py, telegram_research_bot.py)
-apify-client>=1.7.0
+apify-client>=2.5.0
