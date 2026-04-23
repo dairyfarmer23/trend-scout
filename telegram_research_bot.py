@@ -27,6 +27,7 @@ Env vars (see .env.example):
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -103,7 +104,7 @@ def _token_from_vps():
 def _token_from_keychain():
     try:
         r = subprocess.run(
-            ["security", "find-generic-password", "-s", "com.fanuploader", "-a", "telegram_bot_token", "-w"],
+            ["security", "find-generic-password", "-s", "com.trend-scout", "-a", "telegram_bot_token", "-w"],
             capture_output=True, text=True, timeout=5)
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip()
@@ -118,7 +119,7 @@ def get_apify_key():
         return key
     try:
         r = subprocess.run(
-            ["security", "find-generic-password", "-s", "com.fanuploader", "-a", "apify_api_key", "-w"],
+            ["security", "find-generic-password", "-s", "com.trend-scout", "-a", "apify_api_key", "-w"],
             capture_output=True, text=True, timeout=5)
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip()
@@ -574,7 +575,7 @@ def pull_vps_data():
     """Pull trend-scout data from VPS."""
     data = {"videos": [], "scripts": [], "feedback": {}}
 
-    r = ssh_run(f"cat {VPS_TREND_SCOUT}/trends_db.json 2>/dev/null")
+    r = ssh_run(f"cat {shlex.quote(VPS_TREND_SCOUT)}/trends_db.json 2>/dev/null")
     if r.returncode == 0 and r.stdout.strip():
         try:
             db = json.loads(r.stdout)
@@ -582,14 +583,14 @@ def pull_vps_data():
         except json.JSONDecodeError:
             pass
 
-    r = ssh_run(f"cat {VPS_TREND_SCOUT}/latest_scripts.json 2>/dev/null")
+    r = ssh_run(f"cat {shlex.quote(VPS_TREND_SCOUT)}/latest_scripts.json 2>/dev/null")
     if r.returncode == 0 and r.stdout.strip():
         try:
             data["scripts"] = json.loads(r.stdout).get("scripts", [])
         except json.JSONDecodeError:
             pass
 
-    r = ssh_run(f"cat {VPS_TREND_SCOUT}/feedback.json 2>/dev/null")
+    r = ssh_run(f"cat {shlex.quote(VPS_TREND_SCOUT)}/feedback.json 2>/dev/null")
     if r.returncode == 0 and r.stdout.strip():
         try:
             data["feedback"] = json.loads(r.stdout)
@@ -1105,8 +1106,7 @@ def save_to_vault_memory(text, token):
                 mem_file.write_text(f"# Memories\n\n## Recent Context\n{entry}\n")
         else:
             # Running remotely — use SSH
-            escaped_entry = entry.replace("'", "'\\''")
-            ssh_run(f"echo '{escaped_entry}' >> {vault_path}")
+            ssh_run(f"echo {shlex.quote(entry)} >> {shlex.quote(vault_path)}")
 
         send_telegram(token, TELEGRAM_CHAT_ID,
                       f"✅ Saved to memory:\n\n<i>{note}</i>\n\nStored in brain/Memories.md")
@@ -1379,7 +1379,8 @@ def _sync_training_to_vps(training):
             "last_updated": training.get("last_updated", ""),
         }
         payload = json.dumps(vps_data, default=str)
-        ssh_run(f"mkdir -p {VPS_TREND_SCOUT} && cat > {VPS_TREND_SCOUT}/manager_scripts.json << 'TRAIN_EOF'\n{payload}\nTRAIN_EOF")
+        quoted_path = shlex.quote(VPS_TREND_SCOUT)
+        ssh_run(f"mkdir -p {quoted_path} && cat > {quoted_path}/manager_scripts.json << 'TRAIN_EOF'\n{payload}\nTRAIN_EOF")
         print("Training data synced to VPS")
     except Exception as e:
         print(f"VPS sync failed (non-fatal): {e}")
