@@ -126,6 +126,17 @@ The feedback loop matters more than the trend detection. Anyone can scrape TikTo
 
 ---
 
+## Security
+
+A few things worth knowing before you deploy:
+
+- **The bot has one auth mechanism: `TELEGRAM_CHAT_ID`.** Only messages from that chat ID are processed. Don't deploy to a group chat unless you want everyone in it to command your bot.
+- **If your `.env` leaks, rotate `TELEGRAM_BOT_TOKEN` immediately.** Whoever has the token can message your bot and burn your OpenAI + Apify credits.
+- **Single-user machines only.** The TikTok download path uses `yt-dlp --cookies-from-browser chrome`, which reads the active user's Chrome profile.
+- **No rate limiting.** A compromised token = unbounded API spend until you rotate.
+
+For vulnerability reports, see [SECURITY.md](./SECURITY.md).
+
 ## License
 
 MIT — see [LICENSE](./LICENSE). Do whatever. Credit appreciated but not required.
