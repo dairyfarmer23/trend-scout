@@ -481,6 +481,106 @@ MIN_FANS_FOR_DISCOVERY = 1_000
 MAX_FANS_FOR_DISCOVERY = 2_000_000
 
 
+# Niche-fingerprint scoring. Based on actual bios of your confirmed in-niche
+# seeds (@evrythingtallie, @yobellamae, @divinetattoo2.0, @kaliemaye, etc.)
+# Every signal is something ≥2 of those real bios contained.
+_NICHE_FUNNEL_MARKERS = ("link in bio", "linktree", "beacons.ai", "lnk.bio",
+                        "linkbio", "it's on ig", "its on ig", "more on ig",
+                        "more on insta", "spicy on ig", "spicy on insta")
+_NICHE_PLATFORM_MARKERS = ("onlyfans", "of:", "of ", "fansly", "jff",
+                           "just4fans", "justforfans")
+_NICHE_SPICY_EMOJIS = "🌶💋🫦💦🔥💕😈👅❣️"
+_NICHE_AGE_RE = re.compile(r"(?<!\d)(1[7-9]|2[0-5])(?!\d)")  # 17-25 standalone
+# IG handle callouts in many forms: "ig: foo", "insta-foo", "IG @foo",
+# "my ig bar", "follow my insta". Matches the marker word followed by any of
+# colon/dash/space+@/space+word
+_NICHE_IG_RE = re.compile(
+    r"(?i)(?:^|[^a-z])(ig|insta|instagram)[ :\-_]+@?[a-z0-9._]{2,}"
+)
+# Snap: "snap: foo", "snap-foo", "snapchat: foo"
+_NICHE_SNAP_RE = re.compile(
+    r"(?i)(?:^|[^a-z])(snap|snapchat)[ :\-_]+@?[a-z0-9._]{2,}"
+)
+
+
+def _niche_score(bio):
+    """Score a TikTok bio against the niche pattern. Returns (score, signals)."""
+    if not bio:
+        return 0, []
+    score = 0
+    signals = []
+    low = bio.lower()
+
+    if _NICHE_AGE_RE.search(bio):
+        score += 2
+        signals.append("age")
+    if _NICHE_IG_RE.search(bio):
+        score += 3
+        signals.append("ig")
+    if any(m in low for m in _NICHE_FUNNEL_MARKERS):
+        score += 2
+        signals.append("funnel")
+    if any(m in low for m in _NICHE_PLATFORM_MARKERS):
+        score += 4
+        signals.append("of/fansly")
+    if _NICHE_SNAP_RE.search(bio):
+        score += 1
+        signals.append("snap")
+    emoji_hits = sum(1 for c in bio if c in _NICHE_SPICY_EMOJIS)
+    if emoji_hits:
+        score += min(emoji_hits, 3)
+        signals.append(f"spicy×{emoji_hits}")
+
+    return score, signals
+
+
+NICHE_SCORE_THRESHOLD = 4  # requires ≥2 strong signals or 1 platform marker
+
+
+def _verify_niche_candidates(candidates, client):
+    """Batch-verify a list of candidate handles. Returns passers as dict:
+    {handle: {"score": int, "signals": [...], "bio": str, "fans": int}}.
+    Non-passers aren't returned.
+    """
+    if not candidates:
+        return {}
+    profile_urls = [f"https://www.tiktok.com/@{h}" for h in candidates]
+    try:
+        run = client.actor("clockworks/tiktok-scraper").call(
+            run_input={
+                "profiles": profile_urls,
+                "resultsPerPage": 1,  # just need profile info
+                "shouldDownloadVideos": False,
+                "shouldDownloadCovers": False,
+            },
+            timeout_secs=180,
+        )
+        items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+    except Exception as e:
+        print(f"[Verify] Batch scrape failed: {e}")
+        return {}
+
+    passers = {}
+    seen = set()
+    for item in items:
+        author = item.get("authorMeta") or {}
+        handle = (author.get("name") or "").lower().strip()
+        if not handle or handle in seen:
+            continue
+        seen.add(handle)
+        bio = author.get("signature") or ""
+        fans = author.get("fans") or 0
+        if fans < MIN_FANS_FOR_DISCOVERY or fans > MAX_FANS_FOR_DISCOVERY:
+            continue
+        score, signals = _niche_score(bio)
+        if score >= NICHE_SCORE_THRESHOLD:
+            passers[handle] = {
+                "score": score, "signals": signals,
+                "bio": bio[:120], "fans": fans,
+            }
+    return passers
+
+
 def _looks_like_creator_handle(handle):
     """Heuristic: does this look like an individual creator handle vs a brand/word?
     Handles with digits/underscores/dots are almost always real TikTok handles.
@@ -552,6 +652,15 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
     now = datetime.now().isoformat()
     results = {"mention": [], "commenter": [], "music": []}
     skip_blacklist = _DISCOVERY_BLACKLIST | {seed}
+    # Collect candidates from all 3 methods, then verify in one batch Apify call
+    candidates = {}  # handle -> {"methods": [...], "meta": {...}}
+
+    def _add_candidate(handle, method, extra):
+        if handle in skip_blacklist or handle in creators:
+            return
+        entry = candidates.setdefault(handle, {"methods": [], "meta": {}})
+        entry["methods"].append(method)
+        entry["meta"][method] = extra
 
     # ── Method 1: @mentions (with tightened filter) ──
     if use_mentions:
@@ -567,14 +676,7 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
                     continue
                 found[h] = found.get(h, 0) + 1
         for handle, count in sorted(found.items(), key=lambda x: -x[1])[:max_new]:
-            if handle in creators:
-                continue
-            creators[handle] = {
-                "platform": "tiktok", "source": "discovered_via_mention",
-                "discovered": now, "last_seen": now,
-                "discovered_via": seed, "mention_count": count,
-            }
-            results["mention"].append((handle, f"{count}× mentioned"))
+            _add_candidate(handle, "mention", {"mention_count": count})
 
     # ── Method 2: commenters ──
     # Comments actor returns flat records with `uniqueId` (handle) but NO follower
@@ -622,19 +724,10 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
                     key=lambda x: -((x[1]["likes"] + 1) * x[1]["count"]),
                 )[:max_new]
                 for handle, meta in ranked:
-                    if handle in creators:
-                        continue
-                    creators[handle] = {
-                        "platform": "tiktok", "source": "discovered_via_commenter",
-                        "discovered": now, "last_seen": now,
-                        "discovered_via": seed,
+                    _add_candidate(handle, "commenter", {
                         "comment_likes": meta["likes"],
                         "comment_count": meta["count"],
-                    }
-                    detail = f"{meta['count']}× commented"
-                    if meta["likes"]:
-                        detail += f", {meta['likes']} likes"
-                    results["commenter"].append((handle, detail))
+                    })
         except Exception as e:
             print(f"[Discover] Commenter scrape failed: {e}")
 
@@ -679,26 +772,63 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
                     key=lambda x: -x[1]["fans"],
                 )[:max_new]
                 for handle, meta in ranked:
-                    if handle in creators:
-                        continue
-                    creators[handle] = {
-                        "platform": "tiktok", "source": "discovered_via_sound",
-                        "discovered": now, "last_seen": now,
-                        "discovered_via": seed,
+                    _add_candidate(handle, "music", {
                         "sound_fans": meta["fans"],
-                    }
-                    results["music"].append((handle, f"{meta['fans']:,} fans"))
+                    })
         except Exception as e:
             print(f"[Discover] Sound scrape failed: {e}")
+
+    # ── Batch niche verification ──
+    # Every candidate from any method goes through the same niche-bio filter.
+    total_candidates = len(candidates)
+    passers = _verify_niche_candidates(list(candidates.keys()), client) if candidates else {}
+    print(f"[Discover] {total_candidates} candidates → {len(passers)} passed niche filter")
+
+    for handle, pass_meta in passers.items():
+        if handle in creators:
+            continue
+        cand = candidates[handle]
+        # Prefer the earliest method as the recorded source
+        primary_method = cand["methods"][0]
+        combined = {
+            "platform": "tiktok",
+            "source": f"discovered_via_{primary_method}",
+            "discovered": now,
+            "last_seen": now,
+            "discovered_via": seed,
+            "niche_score": pass_meta["score"],
+            "niche_signals": pass_meta["signals"],
+            "fans": pass_meta["fans"],
+            "bio": pass_meta["bio"],
+            "methods": cand["methods"],
+        }
+        for method in cand["methods"]:
+            combined.update(cand["meta"].get(method, {}))
+        creators[handle] = combined
+
+        detail_bits = [f"{pass_meta['fans']:,} fans"]
+        detail_bits.append(f"score {pass_meta['score']}")
+        detail_bits.append("+".join(pass_meta["signals"]))
+        detail = " · ".join(detail_bits)
+        # Bucket into the summary by primary method
+        if primary_method == "mention":
+            results["mention"].append((handle, detail))
+        elif primary_method == "commenter":
+            results["commenter"].append((handle, detail))
+        else:
+            results["music"].append((handle, detail))
 
     save_memory(mem)
 
     total_added = sum(len(v) for v in results.values())
     if total_added == 0:
+        if total_candidates == 0:
+            note = "didn't find any collab/commenter/sound signals."
+        else:
+            note = (f"found {total_candidates} candidates but none passed the "
+                    f"niche filter (needed bio score ≥{NICHE_SCORE_THRESHOLD}).")
         send_telegram(token, TELEGRAM_CHAT_ID,
-                      f"Scanned @{seed} across 3 methods — no new creators found. "
-                      f"Either they don't interact publicly, or all discoveries "
-                      f"are already in your pool.")
+                      f"Scanned @{seed} across 3 methods — {note}")
     else:
         lines = [f"🎯 Discovered {total_added} new creators via @{seed}:"]
         if results["mention"]:
