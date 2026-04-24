@@ -452,12 +452,52 @@ def _video_id_from_url(url):
     return m.group(1) if m else ""
 
 
-def discover_via_creator(seed_username, token, max_videos=10, max_new=15):
-    """P1: Scrape a seed creator's recent videos, extract @mentions from captions,
-    and add those mentioned creators to the memory pool.
+# Known brand / common-word handles that trip up @mention extraction.
+# These show up in captions but aren't actual creator peers we want in the pool.
+_DISCOVERY_BLACKLIST = {
+    # Platforms / generic
+    "tiktok", "instagram", "youtube", "snapchat", "twitter", "x",
+    "fyp", "foryoupage", "official", "creator",
+    # Partial word captures ("too much", "fashion week", etc.)
+    "too", "lor", "louis", "much", "makeup", "fashion", "beauty", "style",
+    "fit", "ootd", "food", "life", "mom", "dad", "wife", "husband",
+    # Makeup / beauty brands commonly tagged
+    "maybelline", "sephora", "kosas", "makeupforever", "ulta", "loreal",
+    "mac", "nyx", "morphe", "rarebeauty", "fentybeauty", "fenty", "dior",
+    "chanel", "nars", "benefit", "elf", "elfcosmetics", "glossier",
+    "kylie", "kyliecosmetics", "kkw", "laneige", "urbandecay", "mario",
+    "haus", "toofaced", "charlotte", "tarte", "hourglass", "dyson",
+    # Fashion / lifestyle brands
+    "gucci", "prada", "lululemon", "nike", "adidas", "shein", "zara",
+    "hm", "forever21", "target", "walmart", "amazon", "amazonfashion",
+    "skims", "fabletics", "abercrombie",
+}
 
-    Captures collabs, stitches, duets, and tags — which is how creators in small
-    niches network. Much higher signal than raw commenter harvesting.
+
+def _looks_like_creator_handle(handle):
+    """Heuristic: does this look like an individual creator handle vs a brand/word?
+    Handles with digits/underscores/dots are almost always real TikTok handles.
+    Pure lowercase short words are usually partial-word captures or brands.
+    """
+    if len(handle) < 4:
+        return False
+    if handle in _DISCOVERY_BLACKLIST:
+        return False
+    # Has non-letter char = likely real handle
+    if any(c in handle for c in "0123456789_."):
+        return True
+    # Pure letters, length 4-8: suspicious (could be a brand or common word)
+    # Require at least 7 chars if no distinguishing characters
+    return len(handle) >= 7
+
+
+def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
+                         use_mentions=True, use_comments=True, use_music=True):
+    """Multi-method discovery: scrape a seed creator and find similar creators via
+    (a) @mentions in captions, (b) commenters with their own following,
+    (c) videos using the same trending sounds.
+
+    Each method contributes independent signal. Returns total new creators added.
     """
     seed = seed_username.lstrip("@").strip().lower()
     if not seed:
@@ -470,14 +510,17 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15):
 
     try:
         from apify_client import ApifyClient
+        from memory_bridge import load_memory, save_memory
     except Exception as e:
-        send_telegram(token, TELEGRAM_CHAT_ID, f"apify-client missing: {e}")
+        send_telegram(token, TELEGRAM_CHAT_ID, f"Dependency missing: {e}")
         return 0
 
     send_telegram(token, TELEGRAM_CHAT_ID,
-                  f"🔍 Discovering new creators via @{seed} — scraping their collabs and tags...")
+                  f"🔍 Discovering via @{seed} — mentions + commenters + trending sounds...")
 
     client = ApifyClient(api_key)
+
+    # ── Scrape the seed's recent videos once (shared across methods) ──
     try:
         run = client.actor("clockworks/tiktok-scraper").call(
             run_input={
@@ -497,64 +540,165 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15):
         send_telegram(token, TELEGRAM_CHAT_ID, f"No videos found for @{seed}")
         return 0
 
-    # Extract @mentions from every caption.
-    MENTION_RE = re.compile(r"@([A-Za-z0-9._]{2,24})")
-    BLACKLIST = {
-        "tiktok", "instagram", "youtube", "snapchat", "twitter", "x",
-        seed, "fyp", "foryoupage",
-    }
-
-    found = {}
-    for item in items:
-        caption = item.get("text", "") or ""
-        for handle in MENTION_RE.findall(caption):
-            h = handle.lower()
-            if h in BLACKLIST or len(h) < 3:
-                continue
-            found[h] = found.get(h, 0) + 1
-
-    if not found:
-        send_telegram(token, TELEGRAM_CHAT_ID,
-                      f"No @-mentions in @{seed}'s last {len(items)} videos. "
-                      f"Try a creator who collabs more.")
-        return 0
-
-    ranked = sorted(found.items(), key=lambda x: -x[1])[:max_new]
-
-    try:
-        from memory_bridge import load_memory, save_memory
-    except Exception:
-        send_telegram(token, TELEGRAM_CHAT_ID, "Memory bridge unavailable.")
-        return 0
-
     mem = load_memory()
     creators = mem.setdefault("creators", {})
     now = datetime.now().isoformat()
-    added = []
-    for handle, count in ranked:
-        if handle in creators:
-            continue
-        creators[handle] = {
-            "platform": "tiktok",
-            "source": "discovered_via_mention",
-            "discovered": now,
-            "last_seen": now,
-            "discovered_via": seed,
-            "mention_count": count,
-        }
-        added.append((handle, count))
+    results = {"mention": [], "commenter": [], "music": []}
+    skip_blacklist = _DISCOVERY_BLACKLIST | {seed}
+
+    # ── Method 1: @mentions (with tightened filter) ──
+    if use_mentions:
+        MENTION_RE = re.compile(r"@([A-Za-z0-9._]{4,24})")
+        found = {}
+        for item in items:
+            caption = item.get("text", "") or ""
+            for handle in MENTION_RE.findall(caption):
+                h = handle.lower()
+                if h in skip_blacklist:
+                    continue
+                if not _looks_like_creator_handle(h):
+                    continue
+                found[h] = found.get(h, 0) + 1
+        for handle, count in sorted(found.items(), key=lambda x: -x[1])[:max_new]:
+            if handle in creators:
+                continue
+            creators[handle] = {
+                "platform": "tiktok", "source": "discovered_via_mention",
+                "discovered": now, "last_seen": now,
+                "discovered_via": seed, "mention_count": count,
+            }
+            results["mention"].append((handle, f"{count}× mentioned"))
+
+    # ── Method 2: commenters (filtered by follower count) ──
+    if use_comments:
+        try:
+            # Take top 3 most-viewed videos from seed for comment scraping
+            top_videos = sorted(items, key=lambda v: v.get("playCount", 0), reverse=True)[:3]
+            video_urls = [v.get("webVideoUrl") for v in top_videos if v.get("webVideoUrl")]
+            if video_urls:
+                run = client.actor("clockworks/tiktok-comments-scraper").call(
+                    run_input={
+                        "postURLs": video_urls,
+                        "commentsPerPost": 50,
+                        "maxRepliesPerComment": 0,
+                    },
+                    timeout_secs=180,
+                )
+                comments = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+                # Filter commenters: must have real following (>1000) and not already known
+                by_commenter = {}
+                for c in comments:
+                    author = c.get("author") or c.get("user") or {}
+                    handle = (author.get("name") or author.get("uniqueId") or "").lower().strip()
+                    fans = author.get("fans") or author.get("followerCount") or 0
+                    if not handle or handle in skip_blacklist or handle in creators:
+                        continue
+                    if fans < 1000:  # screens out horny-guy commenters and bots
+                        continue
+                    if not _looks_like_creator_handle(handle):
+                        continue
+                    prev = by_commenter.get(handle, {"fans": 0, "count": 0})
+                    by_commenter[handle] = {
+                        "fans": max(prev["fans"], fans),
+                        "count": prev["count"] + 1,
+                    }
+                # Rank by follower count × comment frequency
+                ranked = sorted(
+                    by_commenter.items(),
+                    key=lambda x: -(x[1]["fans"] * x[1]["count"]),
+                )[:max_new]
+                for handle, meta in ranked:
+                    if handle in creators:
+                        continue
+                    creators[handle] = {
+                        "platform": "tiktok", "source": "discovered_via_commenter",
+                        "discovered": now, "last_seen": now,
+                        "discovered_via": seed,
+                        "commenter_fans": meta["fans"],
+                        "comment_count": meta["count"],
+                    }
+                    results["commenter"].append(
+                        (handle, f"{meta['fans']:,} fans, {meta['count']}× commented")
+                    )
+        except Exception as e:
+            print(f"[Discover] Commenter scrape failed: {e}")
+
+    # ── Method 3: trending sounds (skipped for original-sound-only creators) ──
+    if use_music:
+        try:
+            # Find sounds used by the seed that are NOT their own original
+            sound_urls = []
+            for item in items:
+                music = item.get("musicMeta") or {}
+                if music.get("musicOriginal"):
+                    continue  # seed's own sound, no other creators use it
+                music_id = music.get("musicId")
+                if music_id:
+                    sound_urls.append(f"https://www.tiktok.com/music/-{music_id}")
+            sound_urls = list(dict.fromkeys(sound_urls))[:3]  # dedupe, cap at 3
+
+            if sound_urls:
+                run = client.actor("clockworks/tiktok-sound-scraper").call(
+                    run_input={"musicURLs": sound_urls, "resultsPerPage": 20},
+                    timeout_secs=180,
+                )
+                sound_videos = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+                by_handle = {}
+                for v in sound_videos:
+                    author = v.get("authorMeta") or {}
+                    handle = (author.get("name") or "").lower().strip()
+                    fans = author.get("fans") or 0
+                    if not handle or handle in skip_blacklist or handle in creators:
+                        continue
+                    if fans < 1000:
+                        continue
+                    if not _looks_like_creator_handle(handle):
+                        continue
+                    prev = by_handle.get(handle, {"fans": 0, "videos": 0})
+                    by_handle[handle] = {
+                        "fans": max(prev["fans"], fans),
+                        "videos": prev["videos"] + 1,
+                    }
+                ranked = sorted(
+                    by_handle.items(),
+                    key=lambda x: -x[1]["fans"],
+                )[:max_new]
+                for handle, meta in ranked:
+                    if handle in creators:
+                        continue
+                    creators[handle] = {
+                        "platform": "tiktok", "source": "discovered_via_sound",
+                        "discovered": now, "last_seen": now,
+                        "discovered_via": seed,
+                        "sound_fans": meta["fans"],
+                    }
+                    results["music"].append((handle, f"{meta['fans']:,} fans"))
+        except Exception as e:
+            print(f"[Discover] Sound scrape failed: {e}")
+
     save_memory(mem)
 
-    if added:
-        summary = f"🎯 Discovered {len(added)} new creators via @{seed}:\n\n"
-        summary += "\n".join(f"• @{h} ({c}× mentioned)" for h, c in added)
-        summary += f"\n\nPool size now: {len(creators)}. They'll appear in the next research run."
+    total_added = sum(len(v) for v in results.values())
+    if total_added == 0:
+        send_telegram(token, TELEGRAM_CHAT_ID,
+                      f"Scanned @{seed} across 3 methods — no new creators found. "
+                      f"Either they don't interact publicly, or all discoveries "
+                      f"are already in your pool.")
     else:
-        summary = (f"Scanned @{seed}'s last {len(items)} videos — "
-                   f"found {len(found)} mentions but all creators are already in your pool.")
-    send_telegram(token, TELEGRAM_CHAT_ID, summary)
-    print(f"[Discover] via @{seed}: +{len(added)} new creators")
-    return len(added)
+        lines = [f"🎯 Discovered {total_added} new creators via @{seed}:"]
+        if results["mention"]:
+            lines.append(f"\n<b>From @mentions ({len(results['mention'])}):</b>")
+            lines += [f"• @{h} ({detail})" for h, detail in results["mention"]]
+        if results["commenter"]:
+            lines.append(f"\n<b>From commenters ({len(results['commenter'])}):</b>")
+            lines += [f"• @{h} ({detail})" for h, detail in results["commenter"]]
+        if results["music"]:
+            lines.append(f"\n<b>From shared sounds ({len(results['music'])}):</b>")
+            lines += [f"• @{h} ({detail})" for h, detail in results["music"]]
+        lines.append(f"\nPool size now: {len(creators)}")
+        send_telegram(token, TELEGRAM_CHAT_ID, "\n".join(lines))
+    print(f"[Discover] via @{seed}: +{total_added} new creators")
+    return total_added
 
 
 def discover_weekly(token, top_n=5):
