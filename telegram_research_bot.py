@@ -452,6 +452,45 @@ def _video_id_from_url(url):
     return m.group(1) if m else ""
 
 
+def _remember_creators_from_refs(tiktok_data, source="manager_inbox"):
+    """Add creators from scraped TikTok data into the shared memory pool.
+
+    Every time the manager sends TikTok URLs, the creators behind those
+    videos get added to the rotation pool so future research runs can scrape
+    them too. Existing creators get their `last_seen` refreshed.
+    """
+    if not tiktok_data:
+        return 0
+    try:
+        from memory_bridge import load_memory, save_memory
+    except Exception:
+        return 0
+    mem = load_memory()
+    creators = mem.setdefault("creators", {})
+    now = datetime.now().isoformat()
+    added, refreshed = 0, 0
+    for item in tiktok_data:
+        username = (item.get("username") or "").strip()
+        if not username or len(username) < 3:
+            continue
+        if username in creators:
+            creators[username]["last_seen"] = now
+            refreshed += 1
+        else:
+            creators[username] = {
+                "platform": "tiktok",
+                "source": source,
+                "discovered": now,
+                "last_seen": now,
+                "nickname": item.get("display_name", ""),
+            }
+            added += 1
+    if added or refreshed:
+        save_memory(mem)
+        print(f"[Memory] Creators: +{added} new, {refreshed} refreshed")
+    return added
+
+
 def _diversify_by_creator(items, get_username, limit=None):
     """Round-robin items by creator so digests don't over-represent one account.
 
@@ -1261,6 +1300,8 @@ def process_updates(token):
         print(f"Processing {len(new_links)} new TikTok links...")
         resolved = resolve_tiktok_urls(new_links)
         tiktok_data = scrape_tiktoks(resolved)
+        # Grow the rotation pool with creators the manager is sending in
+        _remember_creators_from_refs(tiktok_data)
         msg = generate_scripts_from_refs(tiktok_data)
         send_telegram(token, TELEGRAM_CHAT_ID, msg)
 
@@ -1456,6 +1497,9 @@ def cmd_links(urls):
     print("Scraping via Apify...")
     tiktok_data = scrape_tiktoks(resolved)
     print(f"Got data for {len(tiktok_data)} videos")
+
+    # Grow the rotation pool with creators behind these URLs
+    _remember_creators_from_refs(tiktok_data)
 
     print("Generating scripts...")
     msg = generate_scripts_from_refs(tiktok_data)
