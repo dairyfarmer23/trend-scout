@@ -569,10 +569,14 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
             }
             results["mention"].append((handle, f"{count}× mentioned"))
 
-    # ── Method 2: commenters (filtered by follower count) ──
+# ── Method 2: commenters ──
+    # Comments actor returns flat records with `uniqueId` (handle) but NO follower
+    # count. Filter signals we CAN use: (1) skip auto-generated "user\d+" handles
+    # (lurkers), (2) prefer commenters whose comment got likes (engagement proxy
+    # for real account), (3) prefer commenters who comment on multiple seed videos.
+    _AUTOGEN_RE = re.compile(r"^user\d{6,}$")
     if use_comments:
         try:
-            # Take top 3 most-viewed videos from seed for comment scraping
             top_videos = sorted(items, key=lambda v: v.get("playCount", 0), reverse=True)[:3]
             video_urls = [v.get("webVideoUrl") for v in top_videos if v.get("webVideoUrl")]
             if video_urls:
@@ -585,27 +589,26 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
                     timeout_secs=180,
                 )
                 comments = list(client.dataset(run["defaultDatasetId"]).iterate_items())
-                # Filter commenters: must have real following (>1000) and not already known
                 by_commenter = {}
                 for c in comments:
-                    author = c.get("author") or c.get("user") or {}
-                    handle = (author.get("name") or author.get("uniqueId") or "").lower().strip()
-                    fans = author.get("fans") or author.get("followerCount") or 0
+                    handle = (c.get("uniqueId") or "").lower().strip()
                     if not handle or handle in skip_blacklist or handle in creators:
                         continue
-                    if fans < 1000:  # screens out horny-guy commenters and bots
+                    if _AUTOGEN_RE.match(handle):  # auto-generated lurker handle
                         continue
                     if not _looks_like_creator_handle(handle):
                         continue
-                    prev = by_commenter.get(handle, {"fans": 0, "count": 0})
+                    likes = c.get("diggCount", 0) or 0
+                    prev = by_commenter.get(handle, {"likes": 0, "count": 0})
                     by_commenter[handle] = {
-                        "fans": max(prev["fans"], fans),
+                        "likes": prev["likes"] + likes,
                         "count": prev["count"] + 1,
                     }
-                # Rank by follower count × comment frequency
+                # Rank: custom-handle commenters whose comments got likes and who
+                # commented across multiple of seed's videos are highest signal.
                 ranked = sorted(
                     by_commenter.items(),
-                    key=lambda x: -(x[1]["fans"] * x[1]["count"]),
+                    key=lambda x: -((x[1]["likes"] + 1) * x[1]["count"]),
                 )[:max_new]
                 for handle, meta in ranked:
                     if handle in creators:
@@ -614,12 +617,13 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
                         "platform": "tiktok", "source": "discovered_via_commenter",
                         "discovered": now, "last_seen": now,
                         "discovered_via": seed,
-                        "commenter_fans": meta["fans"],
+                        "comment_likes": meta["likes"],
                         "comment_count": meta["count"],
                     }
-                    results["commenter"].append(
-                        (handle, f"{meta['fans']:,} fans, {meta['count']}× commented")
-                    )
+                    detail = f"{meta['count']}× commented"
+                    if meta["likes"]:
+                        detail += f", {meta['likes']} likes"
+                    results["commenter"].append((handle, detail))
         except Exception as e:
             print(f"[Discover] Commenter scrape failed: {e}")
 
@@ -639,7 +643,7 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
 
             if sound_urls:
                 run = client.actor("clockworks/tiktok-sound-scraper").call(
-                    run_input={"musicURLs": sound_urls, "resultsPerPage": 20},
+                    run_input={"musics": sound_urls, "resultsPerPage": 20},
                     timeout_secs=180,
                 )
                 sound_videos = list(client.dataset(run["defaultDatasetId"]).iterate_items())
