@@ -534,7 +534,7 @@ def _niche_score(bio):
     return score, signals
 
 
-NICHE_SCORE_THRESHOLD = 4  # requires ≥2 strong signals or 1 platform marker
+NICHE_SCORE_THRESHOLD = 5  # requires ≥2 strong signals or 1 platform marker
 
 
 def _verify_niche_candidates(candidates, client):
