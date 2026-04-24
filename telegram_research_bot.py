@@ -816,12 +816,24 @@ def research_and_send_scripts(token, min_scripts=4):
 
     print(f"[Research] {len(all_video_urls)} new videos to try transcribing")
 
-    # Transcribe one by one, skip blocked, stop when we have enough
+    # Transcribe one by one, skip blocked, stop when we have enough.
+    # Strict creator diversity: skip a creator who already contributed a
+    # successful script, UNTIL every creator has been attempted at least once.
+    # Then (and only then) allow repeats to fill remaining slots.
     transcribed = []
+    creators_used = set()
+    creators_attempted = set()
+    all_creators = {_username_from_url(u) for u in all_video_urls if _username_from_url(u)}
+
     for url in all_video_urls:
         if len(transcribed) >= min_scripts:
             break
 
+        creator = _username_from_url(url)
+        if creator in creators_used and creators_attempted != all_creators:
+            continue
+
+        creators_attempted.add(creator)
         print(f"[Research] Transcribing: {url[:60]}...")
         try:
             run_input = {"start_urls": url}
@@ -842,6 +854,7 @@ def research_and_send_scripts(token, min_scripts=4):
                         "transcript": clean,
                         "duration": item.get("durationSec", 0),
                     })
+                    creators_used.add(creator)
                     print(f"  ✓ ({len(clean)} chars)")
                 else:
                     print(f"  ✗ blocked/failed, skipping")
