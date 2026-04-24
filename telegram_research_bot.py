@@ -452,6 +452,29 @@ def _video_id_from_url(url):
     return m.group(1) if m else ""
 
 
+def _diversify_by_creator(items, get_username, limit=None):
+    """Round-robin items by creator so digests don't over-represent one account.
+
+    Groups items by creator, then pulls one from each creator in turn,
+    preserving the original encounter order within each group. If ``limit``
+    is given, stops once that many items have been collected.
+    """
+    from collections import OrderedDict
+    by_creator = OrderedDict()
+    for item in items:
+        u = get_username(item) or ""
+        by_creator.setdefault(u, []).append(item)
+
+    result = []
+    while any(by_creator.values()):
+        for u in list(by_creator.keys()):
+            if by_creator[u]:
+                result.append(by_creator[u].pop(0))
+                if limit and len(result) >= limit:
+                    return result
+    return result
+
+
 # ──────────────────────────────────────────
 # Script generation from TikTok references
 # ──────────────────────────────────────────
@@ -636,9 +659,12 @@ def format_digest(vps_data):
 
     msg += "\n"
 
-    # Scripts from VPS
+    # Scripts from VPS — diversify so one creator can't take all 5 slots
     if scripts:
-        for i, s in enumerate(scripts[:5], 1):
+        picked = _diversify_by_creator(
+            scripts, lambda s: s.get("username", ""), limit=5,
+        )
+        for i, s in enumerate(picked, 1):
             topic = s.get("topic", "") or s.get("category", "")
             what = s.get("what_worked", "")
             script = s.get("lana_script", "") or s.get("script", "") or ""
@@ -764,11 +790,19 @@ def research_and_send_scripts(token, min_scripts=4):
         training = _load_training()
         seen_ids = set(training.get("seen_ids", []))
 
+        fresh_items = []
         for item in items:
             vid_url = item.get("webVideoUrl", "")
             vid_id = _video_id_from_url(vid_url)
             if vid_id and vid_id not in seen_ids and vid_url:
-                all_video_urls.append(vid_url)
+                fresh_items.append(item)
+
+        # Interleave by creator so every digest hits diverse accounts
+        diversified = _diversify_by_creator(
+            fresh_items,
+            lambda it: _username_from_url(it.get("webVideoUrl", "")),
+        )
+        all_video_urls = [it.get("webVideoUrl", "") for it in diversified]
 
     except Exception as e:
         print(f"[Research] Profile scrape failed: {e}")
@@ -882,7 +916,11 @@ def chat_with_ai(user_message, token):
     # Build the system prompt with real examples
     recent_scripts_text = ""
     if recent_scripts:
-        for i, s in enumerate(recent_scripts[-5:], 1):
+        # Show the LLM diverse creator examples, not 5 from the same account
+        picked = _diversify_by_creator(
+            recent_scripts[-30:], lambda s: s.get("username", ""), limit=5,
+        )
+        for i, s in enumerate(picked, 1):
             transcript = s.get("transcript", "")
             if transcript:
                 views = s.get("views", 0)
@@ -1035,7 +1073,10 @@ def _get_recent_scripts():
             except Exception:
                 pass
 
-    return scripts[-5:]
+    # Diversify the recent window so callers don't get 5 scripts from one creator
+    return _diversify_by_creator(
+        scripts[-30:], lambda s: s.get("username", ""), limit=5,
+    )
 
 
 def _load_chat_history():
