@@ -764,10 +764,13 @@ def research_and_send_scripts(token, min_scripts=4):
                       "No reference creators yet. Send me TikTok links first so I know what style to find.")
         return
 
-    # Rotate creators — pick up to 6 random ones each time for variety
+    # Rotate creators — sample more than we need so that seen_ids filtering
+    # still leaves enough creators with fresh content. 12 is the sweet spot:
+    # we usually only need 4 scripts, and historically ~50% of sampled creators
+    # have at least one fresh video after the seen_ids filter.
     import random
-    if len(usernames) > 6:
-        usernames = random.sample(usernames, 6)
+    if len(usernames) > 12:
+        usernames = random.sample(usernames, 12)
 
     send_telegram(token, TELEGRAM_CHAT_ID,
                   f"🔍 Researching TikTok — scanning @{', @'.join(usernames)} for new videos...")
