@@ -474,6 +474,13 @@ _DISCOVERY_BLACKLIST = {
 }
 
 
+# Follower-count bounds for discovered creators. Below = lurkers/bots.
+# Above = macro-celebrities (charlidamelio-tier) who are not peer creators in
+# any niche. Target: emerging-to-established creators in the 1k-2M range.
+MIN_FANS_FOR_DISCOVERY = 1_000
+MAX_FANS_FOR_DISCOVERY = 2_000_000
+
+
 def _looks_like_creator_handle(handle):
     """Heuristic: does this look like an individual creator handle vs a brand/word?
     Handles with digits/underscores/dots are almost always real TikTok handles.
@@ -569,7 +576,7 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
             }
             results["mention"].append((handle, f"{count}× mentioned"))
 
-# ── Method 2: commenters ──
+    # ── Method 2: commenters ──
     # Comments actor returns flat records with `uniqueId` (handle) but NO follower
     # count. Filter signals we CAN use: (1) skip auto-generated "user\d+" handles
     # (lurkers), (2) prefer commenters whose comment got likes (engagement proxy
@@ -599,6 +606,10 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
                     if not _looks_like_creator_handle(handle):
                         continue
                     likes = c.get("diggCount", 0) or 0
+                    # >10k likes on a comment = probably a celebrity commenter,
+                    # not a peer creator. Skip.
+                    if likes > 10_000:
+                        continue
                     prev = by_commenter.get(handle, {"likes": 0, "count": 0})
                     by_commenter[handle] = {
                         "likes": prev["likes"] + likes,
@@ -654,7 +665,7 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
                     fans = author.get("fans") or 0
                     if not handle or handle in skip_blacklist or handle in creators:
                         continue
-                    if fans < 1000:
+                    if fans < MIN_FANS_FOR_DISCOVERY or fans > MAX_FANS_FOR_DISCOVERY:
                         continue
                     if not _looks_like_creator_handle(handle):
                         continue
@@ -702,50 +713,6 @@ def discover_via_creator(seed_username, token, max_videos=10, max_new=15,
         lines.append(f"\nPool size now: {len(creators)}")
         send_telegram(token, TELEGRAM_CHAT_ID, "\n".join(lines))
     print(f"[Discover] via @{seed}: +{total_added} new creators")
-    return total_added
-
-
-def discover_weekly(token, top_n=5):
-    """P2: Weekly auto-discovery. Runs discover_via_creator on your top N
-    performers (by filmed-script count), sending a summary message.
-    """
-    try:
-        from memory_bridge import load_memory
-    except Exception:
-        return 0
-
-    mem = load_memory()
-    filmed_by_creator = {}
-    for s in mem.get("scripts", []):
-        if s.get("filmed"):
-            u = s.get("username", "")
-            if u:
-                filmed_by_creator[u] = filmed_by_creator.get(u, 0) + 1
-
-    if not filmed_by_creator:
-        inbox_creators = [u for u, meta in mem.get("creators", {}).items()
-                          if meta.get("source") == "manager_inbox"]
-        top_creators = inbox_creators[:top_n]
-    else:
-        top_creators = [u for u, _ in sorted(
-            filmed_by_creator.items(), key=lambda x: -x[1])[:top_n]]
-
-    if not top_creators:
-        send_telegram(token, TELEGRAM_CHAT_ID,
-                      "No creators to discover from yet. Film some scripts first.")
-        return 0
-
-    send_telegram(token, TELEGRAM_CHAT_ID,
-                  f"📅 Weekly discovery starting — expanding from {len(top_creators)} "
-                  f"top creators: @{', @'.join(top_creators)}")
-
-    total_added = 0
-    for seed in top_creators:
-        total_added += discover_via_creator(seed, token, max_videos=10, max_new=10)
-
-    send_telegram(token, TELEGRAM_CHAT_ID,
-                  f"✅ Weekly discovery done. Added {total_added} new creators. "
-                  f"They'll appear in upcoming research runs.")
     return total_added
 
 
